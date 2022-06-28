@@ -1,17 +1,19 @@
 #! -*- coding:utf-8 -*-
-# 句子对分类任务，LCQMC数据集
+# 情感分类任务, 加载bert权重
+# valid_acc: 94.72, test_acc: 94.11
 
-import numpy as np
+
 from bert4torch.tokenizers import Tokenizer
 from bert4torch.models import build_transformer_model, BaseModel
 from bert4torch.snippets import sequence_padding, Callback, text_segmentate, ListDataset
 import torch.nn as nn
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+import random, os, numpy as np
+from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 
-maxlen = 128
+maxlen = 256
 batch_size = 16
 config_path = 'F:/Projects/pretrain_ckpt/bert/[google_tf_base]--chinese_L-12_H-768_A-12/bert_config.json'
 checkpoint_path = 'F:/Projects/pretrain_ckpt/bert/[google_tf_base]--chinese_L-12_H-768_A-12/pytorch_model.bin'
@@ -19,6 +21,14 @@ dict_path = 'F:/Projects/pretrain_ckpt/bert/[google_tf_base]--chinese_L-12_H-768
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 writer = SummaryWriter(log_dir='./summary')  # prepare summary writer
+
+# 固定seed
+seed = 42
+random.seed(seed)
+os.environ['PYTHONHASHSEED'] = str(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
 
 # 建立分词器
 tokenizer = Tokenizer(dict_path, do_lower_case=True)
@@ -103,14 +113,15 @@ class Evaluator(Callback):
 
     def on_epoch_end(self, global_step, epoch, logs=None):
         val_acc = evaluate(valid_dataloader)
+        test_acc = evaluate(test_dataloader)
         if val_acc > self.best_val_acc:
             self.best_val_acc = val_acc
             # model.save_weights('best_model.pt')
-        print(f'val_acc: {val_acc:.5f}, best_val_acc: {self.best_val_acc:.5f}\n')
+        print(f'val_acc: {val_acc:.5f}, test_acc: {test_acc:.5f}, best_val_acc: {self.best_val_acc:.5f}\n')
 
 
 if __name__ == '__main__':
     evaluator = Evaluator()
-    model.fit(train_dataloader, epochs=20, steps_per_epoch=500, callbacks=[evaluator])
+    model.fit(train_dataloader, epochs=10, steps_per_epoch=None, callbacks=[evaluator])
 else:
     model.load_weights('best_model.pt')

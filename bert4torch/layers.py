@@ -1,21 +1,26 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 import math
 from bert4torch.snippets import get_sinusoid_encoding_table
 from bert4torch.activations import get_activation
 
 
 class LayerNorm(nn.Module):
-    def __init__(self, hidden_size, eps=1e-12, conditional_size=False, bias=True, mode='normal', **kwargs):
+    def __init__(self, hidden_size, eps=1e-12, conditional_size=False, weight=True, bias=True, norm_mode='normal', **kwargs):
         """layernorm 层，这里自行实现，目的是为了兼容 conditianal layernorm，使得可以做条件文本生成、条件分类等任务
            条件layernorm来自于苏剑林的想法，详情：https://spaces.ac.cn/archives/7124
         """
         super(LayerNorm, self).__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+        
+        # 兼容roformer_v2不包含weight
+        if weight:
+            self.weight = nn.Parameter(torch.ones(hidden_size))
         # 兼容t5不包含bias项, 和t5使用的RMSnorm
         if bias:
             self.bias = nn.Parameter(torch.zeros(hidden_size))
-        self.mode = mode
+        self.norm_mode = norm_mode
 
         self.eps = eps
         self.conditional_size = conditional_size
@@ -30,7 +35,7 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         inputs = x[0]
 
-        if self.mode == 'rmsnorm':
+        if self.norm_mode == 'rmsnorm':
             # t5使用的是RMSnorm
             variance = inputs.to(torch.float32).pow(2).mean(-1, keepdim=True)
             o = inputs * torch.rsqrt(variance + self.eps)
@@ -39,6 +44,8 @@ class LayerNorm(nn.Module):
             s = (inputs - u).pow(2).mean(-1, keepdim=True)
             o = (inputs - u) / torch.sqrt(s + self.eps)
 
+        if not hasattr(self, 'weight'):
+            self.weight = 1
         if not hasattr(self, 'bias'):
             self.bias = 0
 
@@ -53,7 +60,7 @@ class LayerNorm(nn.Module):
 
 class MultiHeadAttentionLayer(nn.Module):
     def __init__(self, hidden_size, num_attention_heads, attention_probs_dropout_prob, attention_scale=True,
-                 return_attention_scores=False, **kwargs):
+                 return_attention_scores=False, bias=True, **kwargs):
         super(MultiHeadAttentionLayer, self).__init__()
 
         assert hidden_size % num_attention_heads == 0
@@ -64,10 +71,11 @@ class MultiHeadAttentionLayer(nn.Module):
         self.attention_scale = attention_scale
         self.return_attention_scores = return_attention_scores
 
-        self.q = nn.Linear(hidden_size, hidden_size)
-        self.k = nn.Linear(hidden_size, hidden_size)
-        self.v = nn.Linear(hidden_size, hidden_size)
-        self.o = nn.Linear(hidden_size, hidden_size)
+        self.bias = bias
+        self.q = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.k = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.v = nn.Linear(hidden_size, hidden_size, bias=bias)
+        self.o = nn.Linear(hidden_size, hidden_size, bias=bias)
         self.dropout = nn.Dropout(attention_probs_dropout_prob)
 
         self.a_bias, self.p_bias = kwargs.get('a_bias'), kwargs.get('p_bias')
@@ -151,7 +159,7 @@ class MultiHeadAttentionLayer(nn.Module):
             attention_scores = attention_scores + attention_mask
 
         # 将attention score 归一化到0-1
-        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+        attention_probs = F.softmax(attention_scores, dim=-1)
         attention_probs = self.dropout(attention_probs)
         context_layer = torch.matmul(attention_probs, value_layer)  # [batch_size, num_attention_heads, query_len, attention_head_size]
 
@@ -184,7 +192,7 @@ class MultiHeadAttentionLayer(nn.Module):
 
 
 class PositionWiseFeedForward(nn.Module):
-    def __init__(self, hidden_size, intermediate_size, dropout_rate=0.5, hidden_act='gelu', is_dropout=False, **kwargs):
+    def __init__(self, hidden_size, intermediate_size, dropout_rate=0.5, hidden_act='gelu', is_dropout=False, bias=True, **kwargs):
         # 原生的tf版本的bert在激活函数后，没有添加dropout层，但是在google AI的bert-pytorch开源项目中，多了一层dropout；
         # 并且在pytorch官方的TransformerEncoderLayer的实现中，也有一层dropout层，就像这样：self.linear2(self.dropout(self.activation(self.linear1(src))))；
         # 这样不统一做法的原因不得而知，不过有没有这一层，差别可能不会很大；
@@ -194,8 +202,8 @@ class PositionWiseFeedForward(nn.Module):
 
         self.is_dropout = is_dropout
         self.intermediate_act_fn = get_activation(hidden_act)
-        self.intermediateDense = nn.Linear(hidden_size, intermediate_size)
-        self.outputDense = nn.Linear(intermediate_size, hidden_size)
+        self.intermediateDense = nn.Linear(hidden_size, intermediate_size, bias=bias)
+        self.outputDense = nn.Linear(intermediate_size, hidden_size, bias=bias)
         if self.is_dropout:
             self.dropout = nn.Dropout(dropout_rate)
 
@@ -213,6 +221,99 @@ class PositionWiseFeedForward(nn.Module):
         return x
 
 
+class GatedAttentionUnit(nn.Module):
+    '''门控注意力单元，
+    链接：https://arxiv.org/abs/2202.10447
+    介绍：https://kexue.fm/archives/8934
+    说明：没有加入加性相对位置编码
+    参考pytorch项目：https://github.com/lucidrains/FLASH-pytorch
+    '''
+    
+    def __init__(self, hidden_size, attention_key_size, intermediate_size, attention_probs_dropout_prob, hidden_act, 
+                 is_dropout=False, attention_scale=True, bias=True, normalization='softmax_plus', **kwargs):
+        super().__init__()
+        self.intermediate_size = intermediate_size
+        self.attention_head_size = attention_key_size
+        self.attention_scale = attention_scale
+        self.is_dropout = is_dropout
+        self.normalization = normalization
+        self.hidden_fn = get_activation(hidden_act)
+        self.dropout = nn.Dropout(attention_probs_dropout_prob)
+        self.i_dense = nn.Linear(hidden_size, self.intermediate_size*2+attention_key_size, bias=bias)
+        self.offsetscale = self.OffsetScale(attention_key_size, heads=2, bias=bias)
+        self.o_dense = nn.Linear(self.intermediate_size, hidden_size, bias=bias)
+        
+        self.a_bias, self.p_bias = kwargs.get('a_bias'), kwargs.get('p_bias')
+        if self.p_bias == 'rotary':  # RoPE
+            self.relative_positions_encoding = RoPEPositionEncoding(max_position=kwargs.get('max_position'), embedding_size=self.attention_head_size)
+
+    def forward(self, hidden_states, attention_mask):
+        # 投影变换
+        hidden_states = self.hidden_fn(self.i_dense(hidden_states))
+        u, v, qk = hidden_states.split([self.intermediate_size, self.intermediate_size, self.attention_head_size], dim=-1)
+        q, k = self.offsetscale(qk)  # 仿射变换
+
+        # 加入RoPE
+        if self.p_bias == 'rotary':
+            q = self.relative_positions_encoding(q)
+            k = self.relative_positions_encoding(k)
+
+        # Attention
+        attention_scores = torch.einsum('b i d, b j d -> b i j', q, k)  # [btz, seq_len, seq_len]
+        if self.attention_scale:
+            # seq_len = hidden_states.shape[1]
+            # attention_scores = F.relu(attention_scores/seq_len) ** 2
+             attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
+        if attention_mask is not None:
+            attention_mask = (1.0 - attention_mask) * -1e12
+            attention_scores = attention_scores + attention_mask.squeeze(1)
+
+        # 归一化
+        attention_scores = self.attention_normalize(attention_scores, -1, self.normalization)
+
+        if self.is_dropout:
+            attention_scores = self.dropout(attention_scores)
+
+        # 计算输出
+        out = self.o_dense(u * torch.einsum('b i j, b j d -> b i d', attention_scores, v))
+        return out
+    
+    def attention_normalize(self, a, dim=-1, method='softmax'):
+        """不同的注意力归一化方案
+        softmax：常规/标准的指数归一化；
+        squared_relu：来自 https://arxiv.org/abs/2202.10447 ；
+        softmax_plus：来自 https://kexue.fm/archives/8823 。
+        """
+        if method == 'softmax':
+            return F.softmax(a, dim=dim)
+        else:
+            mask = (a > -1e11).float()
+            l = torch.maximum(torch.sum(mask, dim=dim, keepdims=True), torch.tensor(1).to(mask))
+            if method == 'squared_relu':
+                return F.relu(a)**2 / l
+            elif method == 'softmax_plus':
+                return F.softmax(a * torch.log(l) / torch.log(torch.tensor(512)).to(mask), dim=dim)
+        return a
+
+    class OffsetScale(nn.Module):
+        '''仿射变换
+        '''
+        def __init__(self, head_size, heads=1, bias=True):
+            super().__init__()
+            self.gamma = nn.Parameter(torch.ones(heads, head_size))
+            self.bias = bias
+            if bias:
+                self.beta = nn.Parameter(torch.zeros(heads, head_size))
+            nn.init.normal_(self.gamma, std = 0.02)
+
+        def forward(self, x):
+            out = torch.einsum('... d, h d -> ... h d', x, self.gamma)
+            if self.bias:
+                 out = out + self.beta
+            return out.unbind(dim = -2)
+
+
 class BertEmbeddings(nn.Module):
     """
         embeddings层
@@ -222,19 +323,36 @@ class BertEmbeddings(nn.Module):
         super(BertEmbeddings, self).__init__()
         self.shared_segment_embeddings = shared_segment_embeddings
         self.word_embeddings = nn.Embedding(vocab_size, embedding_size, padding_idx=0)
-        if (kwargs.get('p_bias') not in {'rotary', 'typical_relative', 't5_relative'}) and max_position > 0: # Embeddings时候包含位置编码
+
+        # 位置编码
+        if kwargs.get('p_bias') == 'sinusoid':
+            self.position_embeddings = SinusoidalPositionEncoding(max_position, embedding_size)
+        elif kwargs.get('p_bias') in {'rotary', 'typical_relative', 't5_relative', 'other_relative'}:
+            # 如果使用相对位置编码，则不声明PositionEmbeddings
+            pass
+        elif max_position > 0:
             self.position_embeddings = nn.Embedding(max_position, embedding_size)
+        
+        # segement编码
         if (segment_vocab_size > 0) and (not shared_segment_embeddings):
             self.segment_embeddings = nn.Embedding(segment_vocab_size, embedding_size)
 
-        self.layerNorm = LayerNorm(embedding_size, eps=1e-12, conditional_size=conditional_size)
+        # emb_scale
+        self.emb_scale = kwargs.get('emb_scale', 1)  # transform_xl, xlnet特有
+
+        # LayerNorm
+        self.layerNorm = LayerNorm(embedding_size, eps=1e-12, conditional_size=conditional_size, **kwargs)
         self.dropout = nn.Dropout(drop_rate)
+
         # 如果embedding_size != hidden_size，则再有一个linear(适用于albert矩阵分解)
         if embedding_size != hidden_size:
             self.embedding_hidden_mapping_in = nn.Linear(embedding_size, hidden_size)
 
-    def forward(self, token_ids, segment_ids=None, conditional_emb=None):
-        words_embeddings = self.word_embeddings(token_ids)
+    def forward(self, token_ids, segment_ids=None, conditional_emb=None, additional_embs=None):
+        if (not token_ids.requires_grad) and (token_ids.dtype in {torch.long, torch.int}):
+            words_embeddings = self.word_embeddings(token_ids)
+        else:
+            words_embeddings = token_ids  # 自定义word_embedding，目前仅有VAT中使用
 
         if hasattr(self, 'segment_embeddings'):
             segment_ids = torch.zeros_like(token_ids) if segment_ids is None else segment_ids
@@ -247,12 +365,20 @@ class BertEmbeddings(nn.Module):
         else:
             embeddings = words_embeddings
         
+        # 额外的embedding，如词性等
+        if additional_embs is not None:
+            for emb in additional_embs:
+                embeddings += emb
+
         if hasattr(self, 'position_embeddings'):
             seq_length = token_ids.size(1)
             position_ids = torch.arange(seq_length, dtype=torch.long, device=token_ids.device)
-            position_ids = position_ids.unsqueeze(0).expand_as(token_ids)
+            position_ids = position_ids.unsqueeze(0).repeat(token_ids.shape[0], 1)
             position_embeddings = self.position_embeddings(position_ids)
             embeddings += position_embeddings
+
+        if self.emb_scale != 1:
+            embeddings = embeddings * self.emb_scale  # transform_xl, xlnet特有
 
         if hasattr(self, 'layerNorm'):
             embeddings = self.layerNorm((embeddings, conditional_emb))
@@ -277,15 +403,15 @@ class BertLayer(nn.Module):
         super(BertLayer, self).__init__()
         self.multiHeadAttention = MultiHeadAttentionLayer(hidden_size, num_attention_heads, attention_probs_dropout_prob, **kwargs)
         self.dropout1 = nn.Dropout(dropout_rate)
-        self.layerNorm1 = LayerNorm(hidden_size, eps=1e-12, conditional_size=conditional_size)
-        self.feedForward = PositionWiseFeedForward(hidden_size, intermediate_size, dropout_rate, hidden_act, is_dropout=is_dropout)
+        self.layerNorm1 = LayerNorm(hidden_size, eps=1e-12, conditional_size=conditional_size, **kwargs)
+        self.feedForward = PositionWiseFeedForward(hidden_size, intermediate_size, dropout_rate, hidden_act, is_dropout=is_dropout, **kwargs)
         self.dropout2 = nn.Dropout(dropout_rate)
-        self.layerNorm2 = LayerNorm(hidden_size, eps=1e-12, conditional_size=conditional_size)
+        self.layerNorm2 = LayerNorm(hidden_size, eps=1e-12, conditional_size=conditional_size, **kwargs)
         self.is_decoder = kwargs.get('is_decoder')
         if self.is_decoder:
             self.crossAttention = MultiHeadAttentionLayer(hidden_size, num_attention_heads, attention_probs_dropout_prob, **kwargs)
             self.dropout3 = nn.Dropout(dropout_rate)
-            self.layerNorm3 = LayerNorm(hidden_size, eps=1e-12, conditional_size=conditional_size)
+            self.layerNorm3 = LayerNorm(hidden_size, eps=1e-12, conditional_size=conditional_size, **kwargs)
 
     def forward(self, hidden_states, attention_mask, conditional_emb=None, encoder_hidden_states=None, encoder_attention_mask=None):
         self_attn_output = self.multiHeadAttention(hidden_states, attention_mask)  # self.decoder为true时候，这里的attention_mask是三角的
@@ -310,37 +436,17 @@ class T5Layer(BertLayer):
     """
     def __init__(self, *args, version='t5.1.0', **kwargs):
         super().__init__(*args, **kwargs)
-        # 定义RMSnorm层
-        self.layerNorm1 = LayerNorm(hidden_size=args[0], eps=1e-12, bias=False, mode='rmsnorm', **kwargs)
-        self.layerNorm2 = LayerNorm(hidden_size=args[0], eps=1e-12, bias=False, mode='rmsnorm', **kwargs)
-
-        # 删除对应的bias项
-        self.multiHeadAttention.q.register_parameter('bias', None)
-        self.multiHeadAttention.k.register_parameter('bias', None)
-        self.multiHeadAttention.v.register_parameter('bias', None)
-        self.multiHeadAttention.o.register_parameter('bias', None)
 
         # 如果是t5.1.1结构，则FFN层需要变更
-        if version.endswith('t5.1.0'):
-            self.feedForward.outputDense.register_parameter('bias', None)
-            self.feedForward.intermediateDense.register_parameter('bias', None)
-        elif version.endswith('t5.1.1'):
+        if version.endswith('t5.1.1'):
             kwargs['dropout_rate'] = args[2]
             kwargs['hidden_act'] = args[5]
             self.feedForward = self.T5PositionWiseFeedForward(hidden_size=args[0], intermediate_size=args[4], **kwargs)
-        else:
-            raise ValueError('T5 model only support t5.1.0 and t5.1.1')
 
         # decoder中间有crossAttention
-        if self.is_decoder:
-            self.layerNorm3 = LayerNorm(hidden_size=args[0], eps=1e-12, bias=False, mode='rmsnorm', **kwargs)
-            self.crossAttention.q.register_parameter('bias', None)
-            self.crossAttention.k.register_parameter('bias', None)
-            self.crossAttention.v.register_parameter('bias', None)
-            self.crossAttention.o.register_parameter('bias', None)
-            if hasattr(self.crossAttention, 'relative_positions_encoding'):
-                del self.crossAttention.relative_positions_encoding
-                del self.crossAttention.relative_positions
+        if self.is_decoder and hasattr(self.crossAttention, 'relative_positions_encoding'):
+            del self.crossAttention.relative_positions_encoding
+            del self.crossAttention.relative_positions
 
     def forward(self, hidden_states, attention_mask, conditional_emb=None, encoder_hidden_states=None, encoder_attention_mask=None):
         # bert的layernorm是在attn/ffc之后，Openai-gpt2是在之前
@@ -360,6 +466,8 @@ class T5Layer(BertLayer):
         return hidden_states
 
     class T5PositionWiseFeedForward(PositionWiseFeedForward):
+        '''参考transformer包: https://github.com/huggingface/transformers/blob/main/src/transformers/models/t5/modeling_t5.py
+        '''
         def __init__(self, hidden_size, intermediate_size, **kwargs):
             super().__init__(hidden_size, intermediate_size, **kwargs)
             self.intermediateDense = nn.Linear(hidden_size, intermediate_size, bias=False)
@@ -381,6 +489,202 @@ class T5Layer(BertLayer):
             return x
 
 
+class XlnetLayer(BertLayer):
+    '''Transformer_XL层
+    顺序为: Attention --> Add --> LayerNorm --> Feed Forward --> Add --> LayerNorm
+    '''
+    def __init__(self, hidden_size, num_attention_heads, dropout_rate, attention_probs_dropout_prob, intermediate_size, hidden_act, **kwargs):
+        super().__init__(hidden_size, num_attention_heads, dropout_rate, attention_probs_dropout_prob, intermediate_size, hidden_act, **kwargs)
+        self.pre_lnorm = kwargs.get('pre_lnorm')
+        # multiattn层无bias
+        self.multiHeadAttention = self.RelPartialLearnableMultiHeadAttn(hidden_size, num_attention_heads, attention_probs_dropout_prob, bias=False, **kwargs)
+
+    def forward(self, hidden_states, segment_ids, pos_emb, attention_mask, mems_i, conditional_emb=None):
+        # 拼接mems和query，mems_i: [btz, m_len, hdsz], w: [btz, q_len, hdsz] = [btz, k_len, hdsz]
+        hidden_states_cat = torch.cat([mems_i, hidden_states], 1) if mems_i is not None else hidden_states
+        
+        # Attn
+        if self.pre_lnorm:
+            hidden_states_cat = self.layerNorm1((hidden_states_cat, conditional_emb))
+        self_attn_output = self.multiHeadAttention(hidden_states, hidden_states_cat, pos_emb, attention_mask, segment_ids)
+        hidden_states = hidden_states + self.dropout1(self_attn_output)
+        if not self.pre_lnorm:  # post_lnorm
+            hidden_states = self.layerNorm1((hidden_states, conditional_emb))
+
+        # FFN
+        x = self.layerNorm2((hidden_states, conditional_emb)) if self.pre_lnorm else hidden_states
+        self_attn_output2 = self.feedForward(x)
+        hidden_states = hidden_states + self.dropout2(self_attn_output2)
+        if not self.pre_lnorm:  # post_lnorm
+            hidden_states = self.layerNorm2((hidden_states, conditional_emb))
+        return hidden_states
+
+    class RelPartialLearnableMultiHeadAttn(MultiHeadAttentionLayer):
+        '''Transformer_XL式相对位置编码, 这里修改成了MultiHeadAttentionLayer的batch_first代码格式
+        '''
+        def __init__(self, *args, r_w_bias=None, r_r_bias=None, r_s_bias=None, **kwargs):
+            super().__init__(*args, **kwargs)
+            segment_vocab_size = kwargs.get('segment_vocab_size')
+            if r_r_bias is None or r_w_bias is None:  # Biases are not shared
+                self.r_r_bias = nn.Parameter(torch.FloatTensor(self.num_attention_heads, self.attention_head_size))  # 全局内容偏置
+                self.r_w_bias = nn.Parameter(torch.FloatTensor(self.num_attention_heads, self.attention_head_size))  # 全局位置偏置
+                if segment_vocab_size > 0:
+                    self.r_s_bias = nn.Parameter(torch.FloatTensor(self.num_attention_heads, self.attention_head_size))  # 全局segment偏置
+            else:  # 所有层公用一个
+                self.r_r_bias = r_r_bias
+                self.r_w_bias = r_w_bias
+                self.r_s_bias = r_s_bias
+            if segment_vocab_size > 0:
+                self.seg_embed = nn.Embedding(segment_vocab_size, self.hidden_size)
+
+            self.r = nn.Linear(self.hidden_size, self.hidden_size, bias=self.bias)
+            self.rel_shift_opt = kwargs.get('rel_shift_opt')
+
+        @staticmethod
+        def rel_shift(x, zero_triu=False):
+            '''transformer_xl使用, 向左shift让右上角都是0, 对角线是同一个值, x: [btz, n_head, q_len, k_len]
+            '''
+            q_len, k_len = x.size(2), x.size(-1)
+            zero_pad = torch.zeros((*x.size()[:2], q_len, 1), device=x.device, dtype=x.dtype)
+            x_padded = torch.cat([zero_pad, x], dim=-1)
+            x_padded = x_padded.view(*x.size()[:2], k_len + 1, q_len)
+            x = x_padded[:,:,1:,:].view_as(x)
+            if zero_triu:
+                ones = torch.ones((q_len, k_len), device=x.device)
+                x = x * torch.tril(ones, k_len - q_len)[None,None,:,:]
+            return x
+
+        @staticmethod
+        def rel_shift_bnij(x, klen=-1):
+            ''' xlnet使用
+            '''
+            x_size = x.shape
+            x = x.reshape(x_size[0], x_size[1], x_size[3], x_size[2])
+            x = x[:, :, 1:, :]
+            x = x.reshape(x_size[0], x_size[1], x_size[2], x_size[3] - 1)
+            x = torch.index_select(x, 3, torch.arange(klen, device=x.device, dtype=torch.long))
+            # x = x[:, :, :, :klen]
+            return x
+
+        def forward(self, w, cat, r, attention_mask=None, seg_mat=None):
+            # w: 词向量[btz, q_len, hdsz], cat: w和mem_i拼接后向量[btz, k_len, hdsz], r：相对位置向量[r_len, hdsz]
+            qlen, rlen, bsz = w.size(1), r.size(0), w.size(0)
+            
+            mixed_query_layer = self.q(cat)[:, -qlen:, :]  # 仅取用query部分，不适用mem部分
+            mixed_key_layer = self.k(cat)
+            mixed_value_layer = self.v(cat)
+
+            w_head_q = self.transpose_for_scores(mixed_query_layer)  # [btz, n_head, q_len, d_head]
+            w_head_k = self.transpose_for_scores(mixed_key_layer)  # [btz, n_head, k_len, d_head]
+            w_head_v = self.transpose_for_scores(mixed_value_layer)  # [btz, n_head, k_len, d_head]
+            if hasattr(self, 'seg_embed'):
+                w_head_s = self.seg_embed(seg_mat)  # [btz, q_len, klen, hdsz]
+                w_head_s = w_head_s.reshape(*w_head_s.shape[:3], self.num_attention_heads, self.attention_head_size)
+
+            r_head_k = self.r(r)  # [hdsz, nhead*headsize] = [r_len, 1, nhead*headsize]
+            r_head_k = r_head_k.view(rlen, self.num_attention_heads, self.attention_head_size)  # rlen x n_head x d_head
+
+            #### compute attention score
+            rw_head_q = w_head_q + self.r_w_bias.unsqueeze(1)  # [btz, n_head, q_len, d_head]
+            AC = torch.einsum('bnid,bnjd->bnij', (rw_head_q, w_head_k))  # [btz, n_head, q_len, k_len]
+
+            rr_head_q = w_head_q + self.r_r_bias.unsqueeze(1)  # [btz, n_head, q_len, d_head]
+            BD = torch.einsum('bnid,jnd->bnij', (rr_head_q, r_head_k))  # [btz, n_head, q_len, k_len]
+            BD = self.rel_shift_bnij(BD, klen=AC.shape[3]) if self.rel_shift_opt == 'xlnet' else self.rel_shift(BD)
+
+            if hasattr(self, 'seg_embed') and (self.r_r_bias is not None):
+                rs_head_q = w_head_q + self.r_s_bias.unsqueeze(1)
+                EF = torch.einsum('bnid,bijnd->bnij', (rs_head_q, w_head_s))  # [btz, n_head, q_len, k_len]
+            else:
+                EF = 0
+
+            # # [btz, n_head, q_len, k_len]
+            attention_scores = AC + BD + EF
+            if self.attention_scale:
+                attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+
+            #### compute attention probability
+            if attention_mask is not None and attention_mask.any().item():
+                # attention_mask = (1.0 - attention_mask) * -10000.0
+                # attention_scores = attention_scores + attention_mask  # 这里修改了下，原有的-10000不够接近-inf
+                attention_mask = (1.0 - attention_mask)
+                attention_scores = attention_scores.float().masked_fill(attention_mask.bool(), -1e30).type_as(attention_mask)
+
+            # [btz, n_head, q_len, k_len]
+            attention_probs = F.softmax(attention_scores, dim=-1)
+            attention_probs = self.dropout(attention_probs)
+            context_layer = torch.matmul(attention_probs, w_head_v)  # [batch_size, num_attention_heads, query_len, attention_head_size]
+            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+            new_context_layer_shape = context_layer.size()[:-2] + (self.hidden_size,)
+            context_layer = context_layer.view(*new_context_layer_shape)
+
+            # 是否返回attention scores
+            if self.return_attention_scores:
+                # 这里返回的attention_scores没有经过softmax, 可在外部进行归一化操作
+                return self.o(context_layer), attention_scores
+            else:
+                return self.o(context_layer)
+
+
+class AdaptiveEmbedding(nn.Module):
+    '''Transformer_XL的自适应embedding, 实现不同区间使用不同的维度
+    可以实现如高频词用比如1024或512维，低频词用256或64维, 再用Linear层project到相同的维数
+    '''
+    def __init__(self, vocab_size, embedding_size, hidden_size, cutoffs, div_val=1, sample_softmax=False, **kwargs):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.embedding_size = embedding_size
+        self.cutoffs = cutoffs + [vocab_size]
+        self.div_val = div_val
+        self.hidden_size = hidden_size
+        self.emb_scale = hidden_size ** 0.5
+        self.cutoff_ends = [0] + self.cutoffs
+
+        self.emb_layers = nn.ModuleList()
+        self.emb_projs = nn.ParameterList()
+        if div_val == 1:
+            self.emb_layers.append(nn.Embedding(vocab_size, embedding_size, sparse=sample_softmax > 0))
+            if hidden_size != embedding_size:
+                self.emb_projs.append(nn.Parameter(torch.FloatTensor(hidden_size, embedding_size)))
+        else:
+            for i in range(len(self.cutoffs)):
+                l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
+                d_emb_i = embedding_size // (div_val ** i)
+                self.emb_layers.append(nn.Embedding(r_idx - l_idx, d_emb_i))
+                self.emb_projs.append(nn.Parameter(torch.FloatTensor(hidden_size, d_emb_i)))
+
+    def forward(self, token_ids):
+        if self.div_val == 1:  # 仅有一个embedding
+            embed = self.emb_layers[0](token_ids)  # [btz, seq_len, embedding_size]
+            if self.hidden_size != self.embedding_size:
+                embed = nn.functional.linear(embed, self.emb_projs[0])
+        else:
+            param = next(self.parameters())
+            inp_flat = token_ids.view(-1)
+            emb_flat = torch.zeros([inp_flat.size(0), self.hidden_size], dtype=param.dtype, device=param.device)
+            for i in range(len(self.cutoffs)):
+                l_idx, r_idx = self.cutoff_ends[i], self.cutoff_ends[i + 1]
+
+                mask_i = (inp_flat >= l_idx) & (inp_flat < r_idx)
+                indices_i = mask_i.nonzero().squeeze()
+
+                if indices_i.numel() == 0:
+                    continue
+
+                inp_i = inp_flat.index_select(0, indices_i) - l_idx
+                emb_i = self.emb_layers[i](inp_i)
+                emb_i = nn.functional.linear(emb_i, self.emb_projs[i])
+
+                emb_flat.index_copy_(0, indices_i, emb_i)
+
+            embed_shape = token_ids.size() + (self.hidden_size,)
+            embed = emb_flat.view(embed_shape)
+
+        embed.mul_(self.emb_scale)
+
+        return embed
+
+
 class Identity(nn.Module):
     def __init__(self, *args, **kwargs):
         super(Identity, self).__init__()
@@ -388,6 +692,21 @@ class Identity(nn.Module):
     def forward(self, *args):
         return args[0]
 
+
+class XlnetPositionsEncoding(nn.Module):
+    '''Xlnet, transformer_xl使用的相对位置编码
+       和SinusoidalPositionEncoding区别是一个是间隔排列, 一个是前后排列
+    '''
+    def __init__(self, embedding_size):
+        super().__init__()
+        self.demb = embedding_size
+        inv_freq = 1 / (10000 ** (torch.arange(0.0, embedding_size, 2.0) / embedding_size))
+        self.register_buffer("inv_freq", inv_freq)
+
+    def forward(self, pos_seq):
+        sinusoid_inp = torch.ger(pos_seq, self.inv_freq)
+        pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+        return pos_emb
 
 class RelativePositionsEncoding(nn.Module):
     """nezha用的google相对位置编码
@@ -477,9 +796,7 @@ class SinusoidalPositionEncoding(nn.Module):
     """
     def __init__(self, max_position, embedding_size):
         super(SinusoidalPositionEncoding, self).__init__()
-        position_embeddings = nn.Embedding.from_pretrained(get_sinusoid_encoding_table(max_position, embedding_size), freeze=True)
-        self.register_buffer('position_embeddings', position_embeddings)
-
+        self.position_embeddings = nn.Embedding.from_pretrained(get_sinusoid_encoding_table(max_position, embedding_size), freeze=True) 
     def forward(self, position_ids):
         return self.position_embeddings(position_ids)
 
@@ -506,15 +823,23 @@ class RoPEPositionEncoding(nn.Module):
 class CRF(nn.Module):
     '''直接从pytorch版本的bert中移植过来的
     '''
-    def __init__(self, num_labels):
+    def __init__(self, num_labels, init_transitions=None, freeze=False):
         super(CRF, self).__init__()
         self.num_labels = num_labels
         self.START_TAG_IDX = -2
         self.END_TAG_IDX = -1
-        init_transitions = torch.zeros(self.num_labels + 2, self.num_labels + 2)
+        if init_transitions is None:
+            init_transitions = torch.zeros(self.num_labels + 2, self.num_labels + 2)
+        else:
+            assert init_transitions.shape == (self.num_labels + 2, self.num_labels + 2), 'CRF init_weight shape does not match'
+            init_transitions = torch.tensor(init_transitions, dtype=torch.float)
         init_transitions[:, self.START_TAG_IDX] = -10000.0
         init_transitions[self.END_TAG_IDX, :] = -10000.0
-        self.transitions = nn.Parameter(init_transitions)
+        
+        if not freeze:
+            self.transitions = nn.Parameter(init_transitions)
+        else:
+            self.register_buffer('transitions', init_transitions)
 
     # feats: [bts, seq_len, num_labels+2]
     # mask: [bts, seq_len]
@@ -542,11 +867,11 @@ class CRF(nn.Module):
             cur_partition = self.log_sum_exp(cur_values, tag_size)  # [bts, tag_size]
             mask_idx = mask[idx, :].view(bts, 1).expand(bts, tag_size)  # [bts, tag_size]
             """ effective updated partition part, only keep the partition value of mask value = 1 """
-            masked_cur_partition = cur_partition.masked_select(mask_idx)  # [x * tag_size]
+            masked_cur_partition = cur_partition.masked_select(mask_idx.bool())  # [x * tag_size]
             if masked_cur_partition.dim() != 0:
                 mask_idx = mask_idx.contiguous().view(bts, tag_size, 1)  # [bts, tag_size, 1]
                 """ replace the partition where the maskvalue=1, other partition value keeps the same """
-                partition.masked_scatter_(mask_idx, masked_cur_partition)
+                partition.masked_scatter_(mask_idx.bool(), masked_cur_partition)
         # [bts, tag_size, tag_size]
         cur_values = self.transitions.view(1, tag_size, tag_size).expand(bts, tag_size, tag_size) + \
                      partition.contiguous().view(bts, tag_size, 1).expand(bts, tag_size, tag_size)
@@ -571,7 +896,7 @@ class CRF(nn.Module):
 
         # get all energies except end energy
         tg_energy = torch.gather(scores.view(seq_len, btz, -1), 2, new_tags).view(seq_len, btz)  # [seq_len, btz]
-        tg_energy = tg_energy.masked_select(mask.transpose(1, 0))  # list
+        tg_energy = tg_energy.masked_select(mask.transpose(1, 0).bool())  # list
 
         """ transition for label to STOP_TAG """
         # [btz, tag_size]

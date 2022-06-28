@@ -51,12 +51,13 @@ def collate_fn(batch):
     batch_segment_ids = torch.tensor(sequence_padding(batch_segment_ids), dtype=torch.long, device=device)
     return [batch_token_ids, batch_segment_ids], [batch_token_ids, batch_segment_ids]
 
-train_dataloader = DataLoader(ListDataset(glob.glob('F:/Projects/data/corpus/文本分类/THUCNews/*/*.txt')), 
+train_dataloader = DataLoader(ListDataset(glob.glob('F:/Projects/data/corpus/sentence_classification/THUCNews/*/*.txt')), 
                    batch_size=batch_size, shuffle=True, collate_fn=collate_fn) 
 
 model = build_transformer_model(
     config_path,
     checkpoint_path,
+    with_mlm=True,
     application='unilm',
     keep_tokens=keep_tokens,  # 只保留keep_tokens中的字，精简原字表
 ).to(device)
@@ -67,7 +68,7 @@ class CrossEntropyLoss(nn.CrossEntropyLoss):
         super().__init__(**kwargs)
     def forward(self, outputs, target):
         '''
-        y_pred: [btz, seq_len, hdsz]
+        y_pred: [btz, seq_len, vocab_size]
         targets: y_true, y_segment
         unilm式样，需要手动把非seq2seq部分mask掉
         '''

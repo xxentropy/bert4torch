@@ -6,15 +6,16 @@ import json, os
 from bert4torch.models import build_transformer_model
 from bert4torch.tokenizers import Tokenizer, load_vocab
 from bert4torch.snippets import sequence_padding, text_segmentate
-from bert4torch.snippets import AutoRegressiveDecoder, Callback, ListDataset
+from bert4torch.snippets import Callback, ListDataset
 from tqdm import tqdm
 import torch
 from torchinfo import summary
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 import numpy as np
-import re 
+import re
+import torch.nn.functional as F
 
 # 基本参数
 max_p_len = 256
@@ -158,8 +159,8 @@ def gen_answer(question, passages):
         segment_ids.append([0] * len(token_ids[-1]))
     token_ids = torch.tensor(sequence_padding(token_ids), device=device)
     segment_ids = torch.tensor(sequence_padding(segment_ids), device=device)
-    _, logits = model.predict([token_ids, segment_ids])[:, 1:max_a_len+1, :]
-    probas = nn.Softmax(dim=-1)(logits)
+    logit = model.predict([token_ids, segment_ids])[-1][:, 1:max_a_len+1, :]
+    probas = F.softmax(logit, dim=-1)
     results = {}
     for t, p in zip(all_p_token_ids, probas):
         a, score = tuple(), 0.
@@ -226,7 +227,7 @@ if __name__ == '__main__':
 
     model.fit(
         train_dataloader,
-        # steps_per_epoch=100,
+        steps_per_epoch=100,
         epochs=epochs,
         callbacks=[evaluator]
     )

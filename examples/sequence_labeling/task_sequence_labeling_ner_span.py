@@ -1,6 +1,7 @@
 #! -*- coding:utf-8 -*-
 # span阅读理解方案
 # 数据集：http://s3.bmio.net/kashgari/china-people-daily-ner-corpus.tar.gz
+# [valid_f1]: 96.31
 
 import numpy as np
 import torch
@@ -13,8 +14,8 @@ from bert4torch.tokenizers import Tokenizer
 from bert4torch.models import build_transformer_model, BaseModel
 from tqdm import tqdm
 
-max_len = 512
-batch_size = 8
+max_len = 256
+batch_size = 16
 categories = ['LOC', 'PER', 'ORG']
 categories_id2label = {i: k for i, k in enumerate(categories, start=1)}
 categories_label2id = {k: i for i, k in enumerate(categories, start=1)}
@@ -23,8 +24,16 @@ categories_label2id = {k: i for i, k in enumerate(categories, start=1)}
 config_path = 'F:/Projects/pretrain_ckpt/bert/[google_tf_base]--chinese_L-12_H-768_A-12/bert_config.json'
 checkpoint_path = 'F:/Projects/pretrain_ckpt/bert/[google_tf_base]--chinese_L-12_H-768_A-12/pytorch_model.bin'
 dict_path = 'F:/Projects/pretrain_ckpt/bert/[google_tf_base]--chinese_L-12_H-768_A-12/vocab.txt'
-
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# 固定seed
+import random, os
+seed = 42
+random.seed(seed)
+os.environ['PYTHONHASHSEED'] = str(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+torch.cuda.manual_seed(seed)
 
 # 加载数据集
 class MyDataset(ListDataset):
@@ -106,7 +115,7 @@ class Model(BaseModel):
 
 model = Model().to(device)
 
-class Loss(FocalLoss):
+class Loss(nn.CrossEntropyLoss):
     def forward(self, outputs, labels):
         start_logits, end_logits = outputs
         mask, start_ids, end_ids = labels
@@ -182,14 +191,14 @@ class Evaluator(Callback):
         if f1 > self.best_val_f1:
             self.best_val_f1 = f1
             # model.save_weights('best_model.pt')
-        print(f'[val] f1: {f1:.5f}, p: {precision:.5f} r: {recall:.5f}\n')
+        print(f'[val] f1: {f1:.5f}, p: {precision:.5f} r: {recall:.5f} best_f1: {self.best_val_f1:.5f}')
 
 
 if __name__ == '__main__':
 
     evaluator = Evaluator()
 
-    model.fit(train_dataloader, epochs=50, steps_per_epoch=1000, callbacks=[evaluator])
+    model.fit(train_dataloader, epochs=20, steps_per_epoch=None, callbacks=[evaluator])
 
 else: 
 

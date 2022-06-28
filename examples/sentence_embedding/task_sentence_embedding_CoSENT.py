@@ -55,9 +55,9 @@ def collate_fn(batch):
     return [batch_token_ids], batch_labels.flatten()
 
 # 加载数据集
-train_dataloader = DataLoader(MyDataset(f'F:/Projects/data/corpus/语义相似度/{task_name}/{task_name}.train.data'), batch_size=batch_size, shuffle=True, collate_fn=collate_fn) 
-valid_dataloader = DataLoader(MyDataset(f'F:/Projects/data/corpus/语义相似度/{task_name}/{task_name}.valid.data'), batch_size=batch_size, collate_fn=collate_fn)
-test_dataloader = DataLoader(MyDataset(f'F:/Projects/data/corpus/语义相似度/{task_name}/{task_name}.test.data'), batch_size=batch_size, collate_fn=collate_fn)
+train_dataloader = DataLoader(MyDataset(f'F:/Projects/data/corpus/sentence_embedding/{task_name}/{task_name}.train.data'), batch_size=batch_size, shuffle=True, collate_fn=collate_fn) 
+valid_dataloader = DataLoader(MyDataset(f'F:/Projects/data/corpus/sentence_embedding/{task_name}/{task_name}.valid.data'), batch_size=batch_size, collate_fn=collate_fn)
+test_dataloader = DataLoader(MyDataset(f'F:/Projects/data/corpus/sentence_embedding/{task_name}/{task_name}.test.data'), batch_size=batch_size, collate_fn=collate_fn)
 
 # 定义bert上的模型结构
 class Model(BaseModel):
@@ -108,9 +108,9 @@ def evaluate(model_eval, data):
         embeddings1.append(embeddings[::2])
         embeddings2.append(embeddings[1::2])
         labels.append(batch_labels[::2])
-    embeddings1 = torch.concat(embeddings1).cpu().numpy()
-    embeddings2 = torch.concat(embeddings2).cpu().numpy()
-    labels = torch.concat(labels).cpu().numpy()
+    embeddings1 = torch.cat(embeddings1).cpu().numpy()
+    embeddings2 = torch.cat(embeddings2).cpu().numpy()
+    labels = torch.cat(labels).cpu().numpy()
     cosine_scores = 1 - (paired_cosine_distances(embeddings1, embeddings2))  # cosine距离是1-paired
     eval_pearson_cosine, _ = spearmanr(labels, cosine_scores)
     return eval_pearson_cosine

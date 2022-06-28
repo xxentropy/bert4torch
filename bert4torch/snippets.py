@@ -4,6 +4,7 @@
 import unicodedata
 import six
 import numpy as np
+import re
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import time
@@ -14,6 +15,10 @@ from torch.utils.data import Dataset
 import math
 import gc
 import inspect
+import json
+import torch.nn.functional as F
+import random
+
 
 is_py2 = six.PY2
 
@@ -40,8 +45,9 @@ def truncate_sequences(maxlen, indices, *sequences):
         else:
             return sequences
 
-def text_segmentate(text, maxlen, seps='\n', strips=None):
+def text_segmentate(text, maxlen, seps='\n', strips=None, truncate=True):
     """将文本按照标点符号划分为若干个短句
+       truncate: True表示标点符号切分后仍然超长时, 按照maxlen硬截断分成若干个短句
     """
     text = text.strip().strip(strips)
     if seps and len(text) > maxlen:
@@ -49,24 +55,135 @@ def text_segmentate(text, maxlen, seps='\n', strips=None):
         text, texts = '', []
         for i, p in enumerate(pieces):
             if text and p and len(text) + len(p) > maxlen - 1:
-                texts.extend(text_segmentate(text, maxlen, seps[1:], strips))
+                texts.extend(text_segmentate(text, maxlen, seps[1:], strips, truncate))
                 text = ''
             if i + 1 == len(pieces):
                 text = text + p
             else:
                 text = text + p + seps[0]
         if text:
-            texts.extend(text_segmentate(text, maxlen, seps[1:], strips))
+            texts.extend(text_segmentate(text, maxlen, seps[1:], strips, truncate))
         return texts
+    elif truncate and (not seps) and (len(text) > maxlen):
+        # 标点符号用完，仍然超长，且设置了truncate=True
+        return [text[i*maxlen:(i+1)*maxlen] for i in range(0, int(np.ceil(len(text)/maxlen)))]
     else:
         return [text]
-        
-def lowercase_and_normalize(text):
+
+def merge_segmentate(sequences, maxlen, sep=''):
+    '''把m个句子合并成不超过maxlen的n个句子, 主要用途是合并碎句子
+    '''
+    sequences_new = []
+    text = ''
+    for t in sequences:
+        if text and len(text + sep + t) <= maxlen:
+            text = text + sep + t
+        elif text:
+            sequences_new.append(text)
+            text = t
+        elif len(t) < maxlen: # text为空
+            text = t
+        else:
+            sequences_new.append(t)
+            text = ''
+    if text:
+        sequences_new.append(text)
+    return sequences_new
+
+def text_augmentation(texts, noise_dict=None, noise_len=0, noise_p=0.0, skip_words=None, strategy='random', allow_dup=True):
+    '''简单的EDA策略, 增删改
+    texts: 需要增强的文本/文本list
+    noise_dict: 噪音数据, 元素为str的list, tuple, set
+    noise_len: 噪音长度, 优先试用
+    noise_p: 噪音比例
+    skip_words: 跳过的短语, string/list
+    strategy: 修改的策略, 包含增insert, 删delete, 改replace, 随机random
+    allow_dup: 是否允许同一个位置多次EDA
+    '''
+    def insert(text, insert_idx, noise_dict):
+        text = list(text)
+        for i in insert_idx:
+            text[i] = text[i] + random.choice(noise_dict)
+        return ''.join(text)
+
+    def delete(text, delete_idx):
+        text = list(text)
+        for i in delete_idx:
+            text[i] = ''
+        return ''.join(text)
+
+    def replace(text, replace_idx, noise_dict):
+        text = list(text)
+        for i in replace_idx:
+            text[i] = random.choice(noise_dict)
+        return ''.join(text)
+
+    def search(pattern, sequence, keep_last=True):
+        """从sequence中寻找子串pattern, 返回符合pattern的id集合
+        """
+        n = len(pattern)
+        pattern_idx_set = set()
+        for i in range(len(sequence)):
+            if sequence[i:i + n] == pattern:
+                pattern_idx_set = pattern_idx_set.union(set(range(i, i+n))) if keep_last else pattern_idx_set.union(set(range(i, i+n-1)))
+        return pattern_idx_set
+
+    if (noise_len==0) and (noise_p==0):
+        return texts
+
+    assert strategy in {'insert', 'delete', 'replace', 'random'}, 'EDA strategy only support insert, delete, replace, random'
+
+    if isinstance(texts, str):
+        texts = [texts]
+
+    if skip_words is None:
+        skip_words = []
+    elif isinstance(skip_words, str):
+        skip_words = [skip_words]
+
+    for id, text in enumerate(texts):
+        sel_len = noise_len if noise_len > 0 else int(len(text)*noise_p) # 噪声长度
+        skip_idx = set()  # 不能修改的idx区间
+        for item in skip_words:
+            # insert时最后一位允许插入
+            skip_idx = skip_idx.union(search(item, text, strategy!='insert'))
+
+        sel_idxs = [i for i in range(len(text)) if i not in skip_idx]  # 可供选择的idx区间
+        sel_len = sel_len if allow_dup else min(sel_len, len(sel_idxs))  # 无重复抽样需要抽样数小于总样本
+        if (sel_len == 0) or (len(sel_idxs) == 0):  # 如果不可采样则跳过
+            continue
+        sel_idx = np.random.choice(sel_idxs, sel_len, replace=allow_dup)
+        if strategy == 'insert':
+            texts[id] = insert(text, sel_idx, noise_dict)
+        elif strategy == 'delete':
+            texts[id] = delete(text, sel_idx)
+        elif strategy == 'replace':
+            texts[id] = replace(text, sel_idx, noise_dict)
+        elif strategy == 'random':
+            if random.random() < 0.333:
+                skip_idx = set()  # 不能修改的idx区间
+                for item in skip_words:
+                    # insert时最后一位允许插入
+                    skip_idx = skip_idx.union(search(item, text, keep_last=False))
+                texts[id] = insert(text, sel_idx, noise_dict)
+            elif random.random() < 0.667:
+                texts[id] = delete(text, sel_idx)
+            else:
+                texts[id] = replace(text, sel_idx, noise_dict)
+    return texts if len(texts) > 1 else texts[0]
+
+def lowercase_and_normalize(text, never_split=()):
     """转小写，并进行简单的标准化
     """
     if is_py2:
         text = unicode(text)
-    text = text.lower()
+    
+    # convert non-special tokens to lowercase
+    escaped_special_toks = [re.escape(s_tok) for s_tok in never_split]
+    pattern = r"(" + r"|".join(escaped_special_toks) + r")|" + r"(.+?)"
+    text = re.sub(pattern, lambda m: m.groups()[0] or m.groups()[1].lower(), text)
+
+    # text = text.lower()
     text = unicodedata.normalize('NFD', text)
     text = ''.join([ch for ch in text if unicodedata.category(ch) != 'Mn'])
     return text
@@ -140,94 +257,6 @@ def delete_arguments(*arguments):
         return new_func
 
     return actual_decorator
-
-def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
-    """加载 tf checkpoints 到 pytorch model."""
-    # 需要安装tensorflow，请自行安装
-    try:
-        import re
-
-        import numpy as np
-        import tensorflow as tf
-    except ImportError:
-        logger.error(
-            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
-            "https://www.tensorflow.org/install/ for installation instructions."
-        )
-        raise
-    tf_path = os.path.abspath(tf_checkpoint_path)
-    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
-    # Load weights from TF model
-    init_vars = tf.train.list_variables(tf_path)
-    names = []
-    arrays = []
-    for name, shape in init_vars:
-        logger.info(f"Loading TF weight {name} with shape {shape}")
-        array = tf.train.load_variable(tf_path, name)
-        names.append(name)
-        arrays.append(array)
-
-    for name, array in zip(names, arrays):
-        name = name.split("/")
-        # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
-        # which are not required for using pretrained model
-        if any(
-            n in ["adam_v", "adam_m", "AdamWeightDecayOptimizer", "AdamWeightDecayOptimizer_1", "global_step"]
-            for n in name
-        ):
-            logger.info(f"Skipping {'/'.join(name)}")
-            continue
-        pointer = model
-        for m_name in name:
-            if re.fullmatch(r"[A-Za-z]+_\d+", m_name):
-                scope_names = re.split(r"_(\d+)", m_name)
-            else:
-                scope_names = [m_name]
-            if scope_names[0] == "kernel" or scope_names[0] == "gamma":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "output_bias" or scope_names[0] == "beta":
-                pointer = getattr(pointer, "bias")
-            elif scope_names[0] == "output_weights":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "squad":
-                pointer = getattr(pointer, "classifier")
-            else:
-                try:
-                    pointer = getattr(pointer, scope_names[0])
-                except AttributeError:
-                    logger.info(f"Skipping {'/'.join(name)}")
-                    continue
-            if len(scope_names) >= 2:
-                num = int(scope_names[1])
-                pointer = pointer[num]
-        if m_name[-11:] == "_embeddings":
-            pointer = getattr(pointer, "weight")
-        elif m_name == "kernel":
-            array = np.transpose(array)
-        try:
-            assert (
-                pointer.shape == array.shape
-            ), f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched"
-        except AssertionError as e:
-            e.args += (pointer.shape, array.shape)
-            raise
-        logger.info(f"Initialize PyTorch weight {name}")
-        pointer.data = torch.from_numpy(array)
-    return model
-
-def convert_tf_checkpoint_to_pytorch(tf_checkpoint_path, bert_config_file, pytorch_dump_path):
-    """tf模型转pytorch"""
-    # 初始化 PyTorch model
-    config = BertConfig.from_json_file(bert_config_file)
-    print("Building PyTorch model from configuration: {}".format(str(config)))
-    model = BertForPreTraining(config)
-
-    # 从tf checkpoint加载权重
-    load_tf_weights_in_bert(model, tf_checkpoint_path)
-
-    # 保存pytorch模型
-    print("Save PyTorch model to {}".format(pytorch_dump_path))
-    torch.save(model.state_dict(), pytorch_dump_path)
 
 
 class Progbar(object):
@@ -408,6 +437,8 @@ class Callback(object):
         pass
     def on_batch_end(self, global_step, batch, logs=None):
         pass
+    def on_dataloader_end(self, logs=None):
+        pass
 
 
 class ProgbarLogger(Callback):
@@ -436,7 +467,23 @@ class ProgbarLogger(Callback):
         self.verbose = verbose
         self.epochs = epochs
 
-    def on_epoch_begin(self, global_step, epoch, logs=None):
+    def add_metrics(self, metrics, add_position=None):
+        if add_position is None:
+            add_position = len(self.params['metrics'])
+        if isinstance(metrics, str):
+            metrics = [metrics]
+
+        add_metrics = []
+        for metric in metrics:
+            if metric not in self.params['metrics']:
+                add_metrics.append(metric)
+        self.params['metrics'] = self.params['metrics'][:add_position] + add_metrics + self.params['metrics'][add_position:]
+
+    def on_train_begin(self, logs=None):
+        if self.verbose:
+            print('Start Training'.center(40, '='))
+
+    def on_epoch_begin(self, global_step=None, epoch=None, logs=None):
         if self.verbose:
             print('Epoch %d/%d' % (epoch + 1, self.epochs))
             self.target = self.params['steps']
@@ -445,11 +492,11 @@ class ProgbarLogger(Callback):
                                    stateful_metrics=self.stateful_metrics)
         self.seen = 0
 
-    def on_batch_begin(self, global_step, batch, logs=None):
+    def on_batch_begin(self, global_step=None, batch=None, logs=None):
         if self.seen < self.target:
             self.log_values = []
 
-    def on_batch_end(self, global_step, batch, logs=None):
+    def on_batch_end(self, global_step=None, batch=None, logs=None):
         logs = logs or {}
         self.seen += 1
         for k in self.params['metrics']:
@@ -461,13 +508,18 @@ class ProgbarLogger(Callback):
         if self.verbose and self.seen < self.target:
             self.progbar.update(self.seen, self.log_values)
 
-    def on_epoch_end(self, global_step, epoch, logs=None):
+    def on_epoch_end(self, global_step=None, epoch=None, logs=None):
         logs = logs or {}
         for k in self.params['metrics']:
             if k in logs:
                 self.log_values.append((k, logs[k]))
         if self.verbose:
             self.progbar.update(self.seen, self.log_values)
+    
+    def on_train_end(self, logs=None):
+        if self.verbose:
+            print('Finish Training'.center(40, '='))
+
 
 def metric_mapping(metric, y_pred, y_true):
     if metric == 'accuracy':
@@ -500,7 +552,7 @@ class AutoRegressiveDecoder(object):
             self.first_output_ids = torch.tensor([[self.start_id]], device=device)
 
     @staticmethod
-    def wraps(default_rtype='logits', use_states=False):
+    def wraps(default_rtype='probas', use_states=False):
         """用来进一步完善predict函数
         目前包含: 1. 设置rtype参数，并做相应处理；
                   2. 确定states的使用，并做相应处理；
@@ -683,7 +735,8 @@ def search_layer(model, layer_name, retrun_first=True):
 
 
 class ListDataset(Dataset):
-    def __init__(self, file_path=None, data=None):
+    def __init__(self, file_path=None, data=None, **kwargs):
+        self.kwargs = kwargs
         if isinstance(file_path, (str, list)):
             self.data = self.load_data(file_path)
         elif isinstance(data, list):
@@ -706,9 +759,9 @@ class ListDataset(Dataset):
 def get_sinusoid_encoding_table(n_position, d_hid, padding_idx=None):
     '''Returns: [seq_len, d_hid]
     '''
-    embeddings_table = torch.zeros(n_position, d_hid)
     position = torch.arange(0, n_position, dtype=torch.float).unsqueeze(1)
     div_term = torch.exp(torch.arange(0, d_hid, 2).float() * (-math.log(10000.0) / d_hid))
+    embeddings_table = torch.zeros(n_position, d_hid)
     embeddings_table[:, 0::2] = torch.sin(position * div_term)
     embeddings_table[:, 1::2] = torch.cos(position * div_term)
     return embeddings_table
@@ -749,3 +802,271 @@ def get_kw(cls, kwargs):
         if k not in set(inspect.getargspec(cls)[0]):
             kwargs_new[k] = kwargs[k]
     return kwargs_new
+
+
+class FGM():
+    '''对抗训练
+    '''
+    def __init__(self, model):
+        self.model = model
+        self.backup = {}
+
+    def attack(self, epsilon=1., emb_name='word_embeddings', **kwargs):
+        # emb_name这个参数要换成你模型中embedding的参数名
+        # 例如，self.emb = nn.Embedding(5000, 100)
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name:
+                self.backup[name] = param.data.clone()
+                norm = torch.norm(param.grad) # 默认为2范数
+                if norm != 0 and not torch.isnan(norm):  # nan是为了apex混合精度时:
+                    r_at = epsilon * param.grad / norm
+                    param.data.add_(r_at)
+
+    def restore(self, emb_name='emb', **kwargs):
+        # emb_name这个参数要换成你模型中embedding的参数名
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name: 
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+
+
+class PGD():
+    '''对抗训练
+    '''
+    def __init__(self, model):
+        self.model = model
+        self.emb_backup = {}
+        self.grad_backup = {}
+
+    def attack(self, epsilon=1., alpha=0.3, emb_name='word_embeddings', is_first_attack=False, **kwargs):
+        # emb_name这个参数要换成你模型中embedding的参数名
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name:
+                if is_first_attack:
+                    self.emb_backup[name] = param.data.clone()
+                norm = torch.norm(param.grad)
+                if norm != 0 and not torch.isnan(norm):  # nan是为了apex混合精度时
+                    r_at = alpha * param.grad / norm
+                    param.data.add_(r_at)
+                    param.data = self.project(name, param.data, epsilon)
+
+    def restore(self, emb_name='emb', **kwargs):
+        # emb_name这个参数要换成你模型中embedding的参数名
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and emb_name in name: 
+                assert name in self.emb_backup
+                param.data = self.emb_backup[name]
+        self.emb_backup = {}
+        
+    def project(self, param_name, param_data, epsilon):
+        r = param_data - self.emb_backup[param_name]
+        if torch.norm(r) > epsilon:
+            r = epsilon * r / torch.norm(r)
+        return self.emb_backup[param_name] + r
+        
+    def backup_grad(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.grad_backup[name] = param.grad.clone()
+    
+    def restore_grad(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.grad = self.grad_backup[name]
+
+
+class VAT():
+    '''虚拟对抗训练 https://github.com/namisan/mt-dnn/blob/v0.2/alum/adv_masked_lm.py
+    '''
+    def __init__(self, model, emb_name='word_embeddings', noise_var=1e-5, noise_gamma=1e-6, adv_step_size=1e-3, 
+                 adv_alpha=1, norm_type='l2', **kwargs):
+        self.model = model
+        self.noise_var = noise_var  # 噪声的方差
+        self.noise_gamma = noise_gamma # eps
+        self.adv_step_size = adv_step_size  # 学习率
+        self.adv_alpha = adv_alpha  # 对抗loss的权重
+        self.norm_type = norm_type  # 归一化方式
+        self.embed = None
+        for (name, module) in self.model.named_modules():
+            if emb_name in name:
+                module.register_forward_hook(hook=self.hook)
+
+    def hook(self, module, fea_in, fea_out):
+        self.embed = fea_out
+        return None
+    
+    def forward_(self, train_X, new_embed):
+        # 把原来的train_X中的token_ids换成embedding形式
+        new_train_X = [new_embed] + train_X[1:]
+        adv_output = self.model.forward(*new_train_X) if self.model.forward.__code__.co_argcount >= 3 else self.model.forward(new_train_X)
+        return adv_output
+
+    def virtual_adversarial_training(self, train_X, logits):
+        # 初始扰动 r
+        noise = self.embed.data.new(self.embed.size()).normal_(0, 1) * self.noise_var
+        noise.requires_grad_()
+        # x + r
+        new_embed = self.embed.data.detach() + noise
+        adv_output = self.forward_(train_X, new_embed)  # forward第一次
+        adv_logits = adv_output[0] if isinstance(adv_output, (list, tuple)) else adv_output
+        adv_loss = self.kl(adv_logits, logits.detach(), reduction="batchmean")
+        delta_grad, = torch.autograd.grad(adv_loss, noise, only_inputs=True)
+        norm = delta_grad.norm()
+        # 梯度消失，退出
+        if torch.isnan(norm) or torch.isinf(norm):
+            return None
+        # inner sum
+        noise = noise + delta_grad * self.adv_step_size
+        # projection
+        noise = self.adv_project(noise, norm_type=self.norm_type, eps=self.noise_gamma)
+        new_embed = self.embed.data.detach() + noise
+        new_embed = new_embed.detach()
+        # 在进行一次训练
+        adv_output = self.forward_(train_X, new_embed)  # forward第二次
+        adv_logits = adv_output[0] if isinstance(adv_output, (list, tuple)) else adv_output
+        adv_loss_f = self.kl(adv_logits, logits.detach())
+        adv_loss_b = self.kl(logits, adv_logits.detach())
+        # 在预训练时设置为10，下游任务设置为1
+        adv_loss = (adv_loss_f + adv_loss_b) * self.adv_alpha
+        return adv_loss
+    
+    @staticmethod
+    def kl(inputs, targets, reduction="sum"):
+        """
+        计算kl散度
+        inputs：tensor，logits
+        targets：tensor，logits
+        """
+        loss = F.kl_div(F.log_softmax(inputs, dim=-1), F.softmax(targets, dim=-1), reduction=reduction)
+        return loss
+
+    @staticmethod
+    def adv_project(grad, norm_type='inf', eps=1e-6):
+        """
+        L0,L1,L2正则，对于扰动计算
+        """
+        if norm_type == 'l2':
+            direction = grad / (torch.norm(grad, dim=-1, keepdim=True) + eps)
+        elif norm_type == 'l1':
+            direction = grad.sign()
+        else:
+            direction = grad / (grad.abs().max(-1, keepdim=True)[0] + eps)
+        return direction
+
+
+class WebServing(object):
+    """简单的Web接口
+    用法：
+        arguments = {'text': (None, True), 'n': (int, False)}
+        web = WebServing(port=8864)
+        web.route('/gen_synonyms', gen_synonyms, arguments)
+        web.start()
+        # 然后访问 http://127.0.0.1:8864/gen_synonyms?text=你好
+    说明：
+        基于bottlepy简单封装，仅作为临时测试使用，不保证性能。
+        目前仅保证支持 Tensorflow 1.x + Keras <= 2.3.1。
+        欢迎有经验的开发者帮忙改进。
+    依赖：
+        pip install bottle
+        pip install paste
+        （如果不用 server='paste' 的话，可以不装paste库）
+    """
+    def __init__(self, host='0.0.0.0', port=8000, server='paste'):
+
+        import bottle
+
+        self.host = host
+        self.port = port
+        self.server = server
+        self.bottle = bottle
+
+    def wraps(self, func, arguments, method='GET'):
+        """封装为接口函数
+        参数：
+            func：要转换为接口的函数，需要保证输出可以json化，即需要
+                  保证 json.dumps(func(inputs)) 能被执行成功；
+            arguments：声明func所需参数，其中key为参数名，value[0]为
+                       对应的转换函数（接口获取到的参数值都是字符串
+                       型），value[1]为该参数是否必须；
+            method：GET或者POST。
+        """
+        def new_func():
+            outputs = {'code': 0, 'desc': u'succeeded', 'data': {}}
+            kwargs = {}
+            for key, value in arguments.items():
+                if method == 'GET':
+                    result = self.bottle.request.GET.getunicode(key)
+                else:
+                    result = self.bottle.request.POST.getunicode(key)
+                if result is None:
+                    if value[1]:
+                        outputs['code'] = 1
+                        outputs['desc'] = 'lack of "%s" argument' % key
+                        return json.dumps(outputs, ensure_ascii=False)
+                else:
+                    if value[0] is not None:
+                        result = value[0](result)
+                    kwargs[key] = result
+            try:
+                outputs['data'] = func(**kwargs)
+            except Exception as e:
+                outputs['code'] = 2
+                outputs['desc'] = str(e)
+            return json.dumps(outputs, ensure_ascii=False)
+
+        return new_func
+
+    def route(self, path, func, arguments, method='GET'):
+        """添加接口
+        """
+        func = self.wraps(func, arguments, method)
+        self.bottle.route(path, method=method)(func)
+
+    def start(self):
+        """启动服务
+        """
+        self.bottle.run(host=self.host, port=self.port, server=self.server)
+
+
+def get_pool_emb(hidden_state=None, pooler=None, attention_mask=None, pool_strategy='cls', custom_layer=None):
+    ''' 获取句向量
+    '''
+    if pool_strategy == 'pooler':
+        return pooler
+    elif pool_strategy == 'cls':
+        if isinstance(hidden_state, (list, tuple)):
+            hidden_state = hidden_state[-1]
+        assert isinstance(hidden_state, torch.Tensor), f'{pool_strategy} strategy request tensor hidden_state'
+        return hidden_state[:, 0]
+    elif pool_strategy in {'last-avg', 'mean'}:
+        if isinstance(hidden_state, (list, tuple)):
+            hidden_state = hidden_state[-1]
+        assert isinstance(hidden_state, torch.Tensor), f'{pool_strategy} pooling strategy request tensor hidden_state'
+        hid = torch.sum(hidden_state * attention_mask[:, :, None], dim=1)
+        attention_mask = torch.sum(attention_mask, dim=1)[:, None]
+        return hid / attention_mask
+    elif pool_strategy in {'last-max', 'max'}:
+        if isinstance(hidden_state, (list, tuple)):
+            hidden_state = hidden_state[-1]
+        assert isinstance(hidden_state, torch.Tensor), f'{pool_strategy} pooling strategy request tensor hidden_state'
+        hid = hidden_state * attention_mask[:, :, None]
+        return torch.max(hid, dim=1)
+    elif pool_strategy == 'first-last-avg':
+        assert isinstance(hidden_state, list), f'{pool_strategy} pooling strategy request list hidden_state'
+        hid = torch.sum(hidden_state[1] * attention_mask[:, :, None], dim=1) # 这里不取0
+        hid += torch.sum(hidden_state[-1] * attention_mask[:, :, None], dim=1)
+        attention_mask = torch.sum(attention_mask, dim=1)[:, None]
+        return hid / (2 * attention_mask)
+    elif pool_strategy == 'custom':
+        # 取指定层
+        assert isinstance(hidden_state, list), f'{pool_strategy} pooling strategy request list hidden_state'
+        assert isinstance(custom_layer, (int, list, tuple)), f'{pool_strategy} pooling strategy request int/list/tuple custom_layer'
+        custom_layer = [custom_layer] if isinstance(custom_layer, int) else custom_layer
+        hid = 0
+        for i, layer in enumerate(custom_layer, start=1):
+            hid += torch.sum(hidden_state[layer] * attention_mask[:, :, None], dim=1)
+        attention_mask = torch.sum(attention_mask, dim=1)[:, None]
+        return hid / (i * attention_mask)
+    else:
+        raise ValueError('pool_strategy illegal')
